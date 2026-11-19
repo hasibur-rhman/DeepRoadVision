@@ -1,0 +1,547 @@
+"""
+Road Analyzer Module - Deep Road Scene Perception and Analytics
+Powered by custom YOLO object detection.
+"""
+
+import os
+import json
+from typing import Dict, List, Any, Tuple, Optional
+import numpy as np
+import cv2
+from ultralytics import YOLO
+
+
+# Category groupings
+CATEGORY_MAP = {
+    "person": "Vulnerable User",
+    "rider": "Vulnerable User",
+    "bike": "Two-Wheeler",
+    "motor": "Two-Wheeler",
+    "car": "Vehicle",
+    "bus": "Heavy Vehicle",
+    "truck": "Heavy Vehicle",
+    "traffic light": "Infrastructure",
+    "traffic sign": "Infrastructure",
+    "train": "Rail Transit",
+}
+
+# Aesthetic modern color palette (BGR for OpenCV)
+CLASS_COLORS = {
+    "person": (90, 245, 120),       # Mint Green
+    "rider": (40, 220, 180),        # Turquoise
+    "bike": (230, 80, 240),         # Pink/Purple
+    "motor": (210, 40, 220),        # Vivid Magenta
+    "car": (245, 195, 30),          # Electric Cyan
+    "bus": (30, 150, 255),          # Vivid Orange
+    "truck": (0, 120, 255),         # Deep Orange-Red
+    "traffic light": (20, 220, 245),# Amber/Yellow
+    "traffic sign": (255, 140, 20), # Sky Azure
+    "train": (180, 120, 255),       # Lavender
+}
+
+DEFAULT_COLOR = (200, 200, 200)
+
+
+class RoadAnalyzer:
+    """
+    Analyzes road traffic scenes, detects road participants, evaluates congestion,
+    computes collision/proximity risk, and generates high-fidelity visual HUD overlays.
+    """
+
+    def __init__(self, model_path: str = "best.pt", device: str = "auto"):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found at: {model_path}")
+        self.model_path = model_path
+        
+        # Auto-detect best hardware accelerator
+        if device == "auto" or device is None:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    device = "cuda"
+                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    device = "mps"
+                else:
+                    device = "cpu"
+            except Exception:
+                device = "cpu"
+
+        self.device = device
+        self.model = YOLO(model_path)
+        self.class_names = self.model.names
+
+    def analyze(
+        self,
+        image_input: Any,
+        conf: float = 0.35,
+        iou: float = 0.45,
+        imgsz: int = 640,
+        track: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Runs YOLO detection (or tracking) and performs deep scene analytics.
+
+        :param image_input: Filepath string or numpy array (BGR).
+        :param conf: Confidence threshold (0.0 - 1.0).
+        :param iou: NMS IoU threshold.
+        :param imgsz: Image inference size.
+        :param track: Enable ByteTrack object tracking across video frames.
+        :return: Comprehensive analytics dictionary.
+        """
+        if track:
+            results = self.model.track(
+                source=image_input,
+                conf=conf,
+                iou=iou,
+                imgsz=imgsz,
+                device=self.device,
+                persist=True,
+                verbose=False,
+            )
+        else:
+            results = self.model.predict(
+                source=image_input,
+                conf=conf,
+                iou=iou,
+                imgsz=imgsz,
+                device=self.device,
+                verbose=False,
+            )
+
+        res = results[0]
+        orig_img = res.orig_img
+        height, width = orig_img.shape[:2]
+
+        detections = []
+        counts_by_class = {name: 0 for name in self.class_names.values()}
+        counts_by_category = {
+            "Vehicle": 0,
+            "Heavy Vehicle": 0,
+            "Two-Wheeler": 0,
+            "Vulnerable User": 0,
+            "Infrastructure": 0,
+            "Rail Transit": 0,
+        }
+
+        # Define ego-vehicle danger zone
+        proximity_alerts = []
+
+        if res.boxes is not None and len(res.boxes) > 0:
+            for box in res.boxes:
+                cls_id = int(box.cls[0].item())
+                confidence = float(box.conf[0].item())
+                x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
+                class_name = self.class_names.get(cls_id, str(cls_id))
+
+                track_id = int(box.id[0].item()) if (box.id is not None and len(box.id) > 0) else None
+
+                category = CATEGORY_MAP.get(class_name, "Other")
+                counts_by_class[class_name] = counts_by_class.get(class_name, 0) + 1
+                counts_by_category[category] = counts_by_category.get(category, 0) + 1
+
+                # Calculate spatial metrics
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                box_width = x2 - x1
+                box_height = y2 - y1
+                box_area_ratio = (box_width * box_height) / (width * height)
+
+                # Distance estimation proxy
+                proximity_score = (y2 / height) * 0.7 + min(1.0, box_area_ratio * 10) * 0.3
+
+                # Hazard assessment
+                is_centered = (0.28 * width) <= cx <= (0.72 * width)
+                is_close = y2 >= (0.62 * height)
+
+                is_hazard = False
+                hazard_level = "NONE"
+
+                if is_close and is_centered and category in ["Vehicle", "Heavy Vehicle", "Two-Wheeler", "Vulnerable User"]:
+                    if y2 >= (0.78 * height) or box_area_ratio > 0.08:
+                        hazard_level = "CRITICAL"
+                        is_hazard = True
+                    elif y2 >= (0.62 * height):
+                        hazard_level = "CAUTION"
+                        is_hazard = True
+
+                detection_item = {
+                    "id": len(detections) + 1,
+                    "track_id": track_id,
+                    "class": class_name,
+                    "category": category,
+                    "confidence": round(confidence, 3),
+                    "bbox": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+                    "center": [round(cx, 1), round(cy, 1)],
+                    "proximity_score": round(proximity_score, 3),
+                    "is_hazard": is_hazard,
+                    "hazard_level": hazard_level,
+                }
+                detections.append(detection_item)
+
+                if is_hazard:
+                    proximity_alerts.append({
+                        "object_id": detection_item["id"],
+                        "track_id": track_id,
+                        "class": class_name,
+                        "hazard_level": hazard_level,
+                        "confidence": detection_item["confidence"],
+                        "bbox": detection_item["bbox"],
+                    })
+
+        # Calculate high-level metrics
+        total_vehicles = counts_by_category["Vehicle"] + counts_by_category["Heavy Vehicle"] + counts_by_category["Two-Wheeler"]
+        total_vulnerable = counts_by_category["Vulnerable User"]
+        total_infrastructure = counts_by_category["Infrastructure"]
+        total_objects = len(detections)
+
+        # Traffic Density Classification
+        if total_vehicles <= 4:
+            traffic_density = "FREE FLOW"
+            density_score = 25
+        elif total_vehicles <= 10:
+            traffic_density = "MODERATE"
+            density_score = 55
+        elif total_vehicles <= 18:
+            traffic_density = "HEAVY"
+            density_score = 80
+        else:
+            traffic_density = "CONGESTED"
+            density_score = 98
+
+        # Overall Road Safety Score
+        critical_count = sum(1 for a in proximity_alerts if a["hazard_level"] == "CRITICAL")
+        caution_count = sum(1 for a in proximity_alerts if a["hazard_level"] == "CAUTION")
+
+        safety_score = 100
+        safety_score -= critical_count * 30
+        safety_score -= caution_count * 15
+        if traffic_density in ["HEAVY", "CONGESTED"]:
+            safety_score -= 15
+        safety_score = max(5, min(100, safety_score))
+
+        if critical_count > 0:
+            safety_status = "CRITICAL ALERT"
+        elif caution_count > 0:
+            safety_status = "PROXIMITY WARNING"
+        elif safety_score >= 80:
+            safety_status = "NORMAL / SAFE"
+        else:
+            safety_status = "MODERATE ATTENTION"
+
+        analytics = {
+            "scene_dimensions": {"width": width, "height": height},
+            "summary": {
+                "total_objects": total_objects,
+                "total_vehicles": total_vehicles,
+                "vulnerable_road_users": total_vulnerable,
+                "infrastructure_elements": total_infrastructure,
+                "traffic_density": traffic_density,
+                "density_index": density_score,
+                "road_safety_score": safety_score,
+                "safety_status": safety_status,
+                "critical_hazards": critical_count,
+                "caution_hazards": caution_count,
+            },
+            "counts_by_category": counts_by_category,
+            "counts_by_class": {k: v for k, v in counts_by_class.items() if v > 0},
+            "proximity_alerts": proximity_alerts,
+            "detections": detections,
+        }
+
+        return analytics
+
+    def render_hud(
+        self,
+        image: np.ndarray,
+        analytics: Dict[str, Any],
+        show_danger_zone: bool = True,
+        show_hud_banner: bool = True,
+    ) -> np.ndarray:
+        """
+        Renders a sleek, ultra-modern autonomous driving HUD directly on the video.
+        Features Tesla-style lane trajectory, floating glassmorphism dynamic pills,
+        and high-tech cyber corner-bracket bounding boxes.
+        """
+        annotated = image.copy()
+        height, width = annotated.shape[:2]
+
+        # 1. Ultra-Sleek Autonomous Lane Trajectory (stops well before the hood/windshield)
+        if show_danger_zone:
+            # Trajectory sits purely on the forward road plane
+            y_horizon = int(height * 0.53)
+            y_ground = int(height * 0.74)  # Stops before the car dashboard/hood
+
+            pts_corridor = np.array([
+                [int(width * 0.43), y_horizon],
+                [int(width * 0.57), y_horizon],
+                [int(width * 0.78), y_ground],
+                [int(width * 0.22), y_ground],
+            ], np.int32)
+
+            corridor_overlay = annotated.copy()
+            # Soft neon cyan-green tinted path
+            path_color = (0, 240, 160) if analytics["summary"]["critical_hazards"] == 0 else (0, 60, 255)
+            cv2.fillPoly(corridor_overlay, [pts_corridor], (path_color[0]//5, path_color[1]//5, path_color[2]//5))
+            cv2.addWeighted(corridor_overlay, 0.22, annotated, 0.78, 0, annotated)
+
+            # Draw sleek dashed / glowing lane boundaries
+            cv2.polylines(annotated, [pts_corridor], True, path_color, 1, cv2.LINE_AA)
+
+            # Draw futuristic chevron trajectory markers inside the lane path
+            for frac in [0.25, 0.50, 0.75]:
+                y_c = int(y_horizon + (y_ground - y_horizon) * frac)
+                half_w = int((width * 0.07) + (width * 0.20) * frac)
+                cx = int(width * 0.50)
+                chev_pts = np.array([
+                    [cx - half_w // 2, y_c + 6],
+                    [cx, y_c - 4],
+                    [cx + half_w // 2, y_c + 6],
+                ], np.int32)
+                cv2.polylines(annotated, [chev_pts], False, path_color, 1, cv2.LINE_AA)
+
+        # 2. Modern Cyber Bounding Boxes (Tesla / Mobileye Autonomous Vision Style)
+        # Soft box tint for depth
+        tint_overlay = annotated.copy()
+        for det in analytics["detections"]:
+            x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+            cls_name = det["class"]
+            is_hazard = det["is_hazard"]
+            hazard_level = det["hazard_level"]
+
+            if is_hazard and hazard_level == "CRITICAL":
+                box_color = (0, 0, 255)
+            elif is_hazard and hazard_level == "CAUTION":
+                box_color = (0, 140, 255)
+            else:
+                box_color = CLASS_COLORS.get(cls_name, DEFAULT_COLOR)
+
+            cv2.rectangle(tint_overlay, (x1, y1), (x2, y2), box_color, -1)
+        cv2.addWeighted(tint_overlay, 0.07, annotated, 0.93, 0, annotated)
+
+        # Sleek brackets, target pips and floating badges
+        for det in analytics["detections"]:
+            x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+            cls_name = det["class"]
+            conf = det["confidence"]
+            track_id = det.get("track_id")
+            is_hazard = det["is_hazard"]
+            hazard_level = det["hazard_level"]
+
+            if is_hazard and hazard_level == "CRITICAL":
+                box_color = (0, 0, 255)
+                c_thick = 2
+            elif is_hazard and hazard_level == "CAUTION":
+                box_color = (0, 140, 255)
+                c_thick = 2
+            else:
+                box_color = CLASS_COLORS.get(cls_name, (0, 240, 255))
+                c_thick = 2
+
+            # Very thin hairline border
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 1, cv2.LINE_AA)
+
+            # Prominent corner brackets (Mobileye / Tesla vision style)
+            c_len = max(6, min(16, (x2 - x1) // 4, (y2 - y1) // 4))
+            # Top-Left
+            cv2.line(annotated, (x1, y1), (x1 + c_len, y1), box_color, c_thick, cv2.LINE_AA)
+            cv2.line(annotated, (x1, y1), (x1, y1 + c_len), box_color, c_thick, cv2.LINE_AA)
+            # Top-Right
+            cv2.line(annotated, (x2, y1), (x2 - c_len, y1), box_color, c_thick, cv2.LINE_AA)
+            cv2.line(annotated, (x2, y1), (x2, y1 + c_len), box_color, c_thick, cv2.LINE_AA)
+            # Bottom-Left
+            cv2.line(annotated, (x1, y2), (x1 + c_len, y2), box_color, c_thick, cv2.LINE_AA)
+            cv2.line(annotated, (x1, y2), (x1, y2 - c_len), box_color, c_thick, cv2.LINE_AA)
+            # Bottom-Right
+            cv2.line(annotated, (x2, y2), (x2 - c_len, y2), box_color, c_thick, cv2.LINE_AA)
+            cv2.line(annotated, (x2, y2), (x2, y2 - c_len), box_color, c_thick, cv2.LINE_AA)
+
+            # Floating Modern Pill Badge
+            id_prefix = f"#{track_id} " if track_id is not None else ""
+            label = f"{id_prefix}{cls_name.upper()} {int(conf * 100)}%"
+            if is_hazard:
+                label += f" [{hazard_level}]"
+
+            (t_w, t_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+            b_y2 = max(t_h + 8, y1 - 3)
+            b_y1 = b_y2 - t_h - 7
+            b_x1 = max(2, x1)
+            b_x2 = min(width - 2, x1 + t_w + 14)
+
+            # Dark translucent pill background
+            pill_overlay = annotated.copy()
+            cv2.rectangle(pill_overlay, (b_x1, b_y1), (b_x2, b_y2), (18, 22, 28), -1)
+            cv2.addWeighted(pill_overlay, 0.85, annotated, 0.15, 0, annotated)
+
+            # Pill border matching object category
+            cv2.rectangle(annotated, (b_x1, b_y1), (b_x2, b_y2), box_color, 1, cv2.LINE_AA)
+
+            # High-contrast label text
+            cv2.putText(
+                annotated,
+                label,
+                (b_x1 + 7, b_y2 - 3),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        # 3. Floating Glassmorphic Dynamic Pills (No clunky top banner!)
+        if show_hud_banner:
+            summary = analytics["summary"]
+
+            # --- Top-Left Floating Dynamic Glass Pill ---
+            pill_w = 460
+            pill_h = 36
+            px1, py1 = 20, 18
+            px2, py2 = px1 + pill_w, py1 + pill_h
+
+            pill_bg = annotated.copy()
+            cv2.rectangle(pill_bg, (px1, py1), (px2, py2), (12, 16, 22), -1)
+            cv2.addWeighted(pill_bg, 0.78, annotated, 0.22, 0, annotated)
+            cv2.rectangle(annotated, (px1, py1), (px2, py2), (40, 55, 75), 1, cv2.LINE_AA)
+
+            # Glowing status indicator dot
+            cv2.circle(annotated, (px1 + 16, py1 + 18), 4, (0, 255, 180), -1, cv2.LINE_AA)
+            cv2.putText(annotated, "AUTONOMOUS VISION", (px1 + 26, py1 + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 180), 1, cv2.LINE_AA)
+
+            # Telemetry metrics line inside the pill
+            telem_txt = f"V: {summary['total_vehicles']}  |  VRU: {summary['vulnerable_road_users']}  |  SIGNS: {summary['infrastructure_elements']}  |  {summary['traffic_density']}"
+            cv2.putText(annotated, telem_txt, (px1 + 195, py1 + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 230, 240), 1, cv2.LINE_AA)
+
+            # --- Top-Right Floating Safety Shield Pill ---
+            status_txt = f"SHIELD: {summary['road_safety_score']}%"
+            (st_w, st_h), _ = cv2.getTextSize(status_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+            s_px2 = width - 20
+            s_px1 = s_px2 - st_w - 34
+            s_py1, s_py2 = 18, 18 + pill_h
+
+            s_bg = annotated.copy()
+            cv2.rectangle(s_bg, (s_px1, s_py1), (s_px2, s_py2), (12, 16, 22), -1)
+            cv2.addWeighted(s_bg, 0.78, annotated, 0.22, 0, annotated)
+
+            shield_color = (0, 255, 120) if summary["road_safety_score"] >= 80 else (0, 160, 255)
+            cv2.rectangle(annotated, (s_px1, s_py1), (s_px2, s_py2), shield_color, 1, cv2.LINE_AA)
+            cv2.circle(annotated, (s_px1 + 14, s_py1 + 18), 4, shield_color, -1, cv2.LINE_AA)
+            cv2.putText(annotated, status_txt, (s_px1 + 24, s_py1 + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # --- Minimal Bottom Watermark Tag (Bottom-Left) ---
+            bm_text = "DEEPROADVISION // HASIB UR RAHMAN"
+            (b_w, b_h), _ = cv2.getTextSize(bm_text, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+            bm_bg = annotated.copy()
+            cv2.rectangle(bm_bg, (18, height - 32), (28 + b_w, height - 10), (12, 16, 22), -1)
+            cv2.addWeighted(bm_bg, 0.65, annotated, 0.35, 0, annotated)
+            cv2.putText(annotated, bm_text, (23, height - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 160, 180), 1, cv2.LINE_AA)
+
+        return annotated
+
+    def render_linkedin_canvas(
+        self,
+        annotated_frame: np.ndarray,
+        analytics: Dict[str, Any],
+        canvas_size: int = 1080,
+    ) -> np.ndarray:
+        """
+        Wraps the video frame into a viral, professional 1:1 LinkedIn format video (1080x1080)
+        featuring branded header title cards, tech stack pills, real-time KPI tiles, and author watermark.
+        """
+        canvas = np.full((canvas_size, canvas_size, 3), (18, 20, 26), dtype=np.uint8)
+
+        # 1. Header Area (0 to 190)
+        # Top gradient/accent line
+        cv2.line(canvas, (0, 3), (canvas_size, 3), (0, 255, 180), 4, cv2.LINE_AA)
+
+        # Project Title
+        title = "AI DEEP ROAD SCENE PERCEPTION"
+        cv2.putText(canvas, title, (40, 58), cv2.FONT_HERSHEY_DUPLEX, 1.15, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Subtitle
+        sub = "Real-Time Multi-Object Tracking • Forward Collision Risk • Scene Analytics"
+        cv2.putText(canvas, sub, (40, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (170, 185, 205), 1, cv2.LINE_AA)
+
+        # Tech Badges (YOLOv8, ByteTrack, OpenCV, Python)
+        badges = ["YOLO VISION", "BYTETRACK", "COLLISION AI", "REAL-TIME"]
+        bx = 40
+        by = 130
+        for b in badges:
+            (bw, bh), _ = cv2.getTextSize(b, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(canvas, (bx, by), (bx + bw + 18, by + 28), (32, 38, 52), -1)
+            cv2.rectangle(canvas, (bx, by), (bx + bw + 18, by + 28), (55, 75, 105), 1, cv2.LINE_AA)
+            cv2.putText(canvas, b, (bx + 9, by + 19), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 240, 255), 1, cv2.LINE_AA)
+            bx += bw + 28
+
+        # 2. Centered 16:9 Video Canvas (y=190 to y=798)
+        video_h = int(canvas_size * 9 / 16)  # 608 px
+        video_y1 = 190
+        video_y2 = video_y1 + video_h
+        resized_frame = cv2.resize(annotated_frame, (canvas_size, video_h), interpolation=cv2.INTER_LINEAR)
+        canvas[video_y1:video_y2, 0:canvas_size] = resized_frame
+
+        # Separator borders
+        cv2.line(canvas, (0, video_y1), (canvas_size, video_y1), (45, 55, 75), 2, cv2.LINE_AA)
+        cv2.line(canvas, (0, video_y2), (canvas_size, video_y2), (45, 55, 75), 2, cv2.LINE_AA)
+
+        # 3. Footer Telemetry & Branding Area (y=798 to 1080)
+        summary = analytics["summary"]
+
+        cw = (canvas_size - 40 * 2 - 20 * 3) // 4  # approx 235px each
+        cy1 = 825
+        cy2 = 980
+
+        safety_color = (0, 255, 120)
+        if summary["safety_status"] == "CRITICAL ALERT":
+            safety_color = (0, 0, 255)
+        elif summary["safety_status"] == "PROXIMITY WARNING":
+            safety_color = (0, 160, 255)
+
+        cards = [
+            ("TOTAL VEHICLES", str(summary["total_vehicles"]), (255, 195, 30)),
+            ("PEDESTRIANS / VRU", str(summary["vulnerable_road_users"]), (90, 245, 120)),
+            ("TRAFFIC DENSITY", summary["traffic_density"], (30, 180, 255)),
+            ("SAFETY SCORE", f"{summary['road_safety_score']}/100", safety_color),
+        ]
+
+        for idx, (label, val, accent) in enumerate(cards):
+            cx1 = 40 + idx * (cw + 20)
+            cx2 = cx1 + cw
+            cv2.rectangle(canvas, (cx1, cy1), (cx2, cy2), (25, 30, 42), -1)
+            cv2.rectangle(canvas, (cx1, cy1), (cx2, cy2), (45, 55, 75), 1, cv2.LINE_AA)
+            cv2.line(canvas, (cx1, cy1), (cx2, cy1), accent, 3, cv2.LINE_AA)
+            cv2.putText(canvas, label, (cx1 + 14, cy1 + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 165, 185), 1, cv2.LINE_AA)
+            font_scale = 0.85 if len(val) <= 5 else 0.65
+            cv2.putText(canvas, val, (cx1 + 14, cy1 + 95), cv2.FONT_HERSHEY_DUPLEX, font_scale, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Bottom Watermark Bar
+        watermark = "DeepRoadVision // AI Autonomous Perception  |  GitHub: hasibur-rhman/DeepRoadVision"
+        cv2.putText(canvas, watermark, (40, 1035), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (140, 155, 180), 1, cv2.LINE_AA)
+
+        return canvas
+
+    def process_image_file(
+        self,
+        image_path: str,
+        output_image_path: Optional[str] = None,
+        output_json_path: Optional[str] = None,
+        conf: float = 0.35,
+    ) -> Tuple[Dict[str, Any], np.ndarray]:
+        """
+        Convenience function to analyze a file on disk and optionally save outputs.
+        """
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Could not load image from {image_path}")
+
+        analytics = self.analyze(img, conf=conf)
+        annotated = self.render_hud(img, analytics)
+
+        if output_image_path:
+            os.makedirs(os.path.dirname(os.path.abspath(output_image_path)), exist_ok=True)
+            cv2.imwrite(output_image_path, annotated)
+
+        if output_json_path:
+            os.makedirs(os.path.dirname(os.path.abspath(output_json_path)), exist_ok=True)
+            with open(output_json_path, "w", encoding="utf-8") as f:
+                json.dump(analytics, f, indent=2)
+
+        return analytics, annotated
